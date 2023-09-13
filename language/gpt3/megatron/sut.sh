@@ -1,10 +1,10 @@
 
-mode=$1
+# mode=$1
 model=./model/
 dataset=./data/cnn_eval.json
 
-python main.py \
-    --scenario=${mode} \
+ipdb3 main.py \
+    --scenario=Offline \
     --dataset-path=${dataset} \
-    --max_examples=50 \
+    --max_examples=1 \
     --accuracy

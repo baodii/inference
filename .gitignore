@@ -1,4 +1,14 @@
 loadgen/build/
+cscope.out
+cscope/
+tags
 libmlperf_loadgen.a
 __pycache__/
 generated/
+language/gpt3/megatron/cscope.out
+language/gpt3/megatron/cscope/
+language/gpt3/megatron/tags
+language/gpt3/megatron/model
+language/gpt3/megatron/data
+language/gpt3/megatron/build
+language/gpt3/megatron/*.log

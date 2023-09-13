@@ -10,11 +10,7 @@ TOKENIZER_MODEL_FILE=./data/c4_en_301_5Mexp2_spm.model
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-# pip install flask-restful
-
-# mpirun -np 1 python dump_env.py
-
-torchrun $DISTRIBUTED_ARGS text_generation_server.py   \
+python ts_zarr.py   \
        --tensor-model-parallel-size 1  \
        --pipeline-model-parallel-size 1  \
        --num-layers 24  \

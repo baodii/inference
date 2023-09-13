@@ -24,6 +24,7 @@ from megatron.initialize import initialize_megatron
 from megatron.arguments import core_transformer_config_from_args
 from megatron.model import GPTModel
 from megatron.training import get_model
+# from megatron.core.dist_checkpointing import load as megatron_load
 import torch
 import deepspeed
 
@@ -55,24 +56,29 @@ class MegatronGenerate(Resource):
 
     @staticmethod
     def send_do_generate():
-        choice = torch.LongTensor([GENERATE_NUM])
+        choice = torch.xpu.LongTensor([GENERATE_NUM])
         torch.distributed.broadcast(choice, 0)
 
     @staticmethod
     def send_do_beam_search():
-        choice = torch.LongTensor([BEAM_NUM])
+        choice = torch.xpu.LongTensor([BEAM_NUM])
         torch.distributed.broadcast(choice, 0)
 
     @staticmethod
     def sync_input(input_ids, input_length):
-        input_length_tensor = torch.LongTensor(input_length)
+        input_length_tensor = torch.xpu.LongTensor(input_length)
         torch.distributed.broadcast(input_length_tensor, 0)
-        input_ids_tensor = torch.LongTensor(input_ids)
+        input_ids_tensor = torch.xpu.LongTensor(input_ids)
         torch.distributed.broadcast(input_ids_tensor, 0)
         return input_ids_tensor, input_length_tensor
 
     def put(self):
         args = get_args()
+        # import pdb
+        # pdb.set_trace()
+        # print('---------------------megatron generate--------------------------------------')
+        import os
+        print('---------------------------------server pid: -------------------------------------------', os.getpid())
         if not "input_ids" in request.get_json():
             return "input_ids argument required", 400
 
@@ -121,35 +127,36 @@ class MegatronGenerate(Resource):
                         print("ERROR")
                         return jsonify({"output": [[]], "is_error": True})
                 else:
-                    try:
-                        MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
-                        input_ids_tensor, input_length_tensor = MegatronGenerate.sync_input(
-                            input_ids, input_length
+                    # try:
+                    MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
+                    input_ids_tensor, input_length_tensor = MegatronGenerate.sync_input(
+                        input_ids, input_length
+                    )
+                    input_ids_tensor = input_ids_tensor.to('xpu:{}'.format(torch.xpu.current_device()))
+                    input_length_tensor = input_length_tensor.to('xpu:{}'.format(torch.xpu.current_device()))
+                    (
+                        output_tokens,
+                        _,
+                        _,
+                    ) = generate_tokens_probs_and_return_on_first_stage(
+                        self.model,
+                        input_ids_tensor,
+                        input_length_tensor,
+                        top_k=self.gen_kwargs.get("top_k", 4),
+                        temperature=self.gen_kwargs.get("temperature", 0.0),
+                    )
+                    output_batch_truncated = []
+                    for data, source_len in zip(output_tokens, input_length_tensor):
+                        output_batch_truncated.append(
+                            data[source_len:].cpu().numpy().tolist()
                         )
-                        (
-                            output_tokens,
-                            _,
-                            _,
-                        ) = generate_tokens_probs_and_return_on_first_stage(
-                            self.model,
-                            input_ids_tensor,
-                            input_length_tensor,
-                            top_k=self.gen_kwargs.get("top_k", 4),
-                            temperature=self.gen_kwargs.get("temperature", 0.0),
-                            min_length = gen_kwargs.get("min_new_tokens", 30),
-                        )
-                        output_batch_truncated = []
-                        for data, source_len in zip(output_tokens, input_length_tensor):
-                            output_batch_truncated.append(
-                                data[source_len:].cpu().numpy().tolist()
-                            )
-                        if self.log:
-                            print("end time: ", datetime.datetime.now())
-                        return jsonify({"output": output_batch_truncated})
-                    except Exception as e:
-                        print(str(e))
-                        print("ERROR")
-                        return jsonify({"output": [[]], "is_error": True})
+                    if self.log:
+                        print("end time: ", datetime.datetime.now())
+                    return jsonify({"output": output_batch_truncated})
+                    # except Exception as e:
+                    #     print(str(e))
+                    #     print("ERROR")
+                    #     return jsonify({"output": [[]], "is_error": True})
 
             except ValueError as ve:
                 return ve.args[0]
@@ -181,6 +188,7 @@ def model_provider(pre_process=True, post_process=True):
         pre_process=pre_process,
         post_process=post_process,
     )
+    # model = model.eval()
 
     return model
 
@@ -229,78 +237,81 @@ if __name__ == "__main__":
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
     # Set up model and load checkpoint
-    model = get_model(model_provider)
-    # for name,parameters in model[0].named_parameters():
-    #     print(name, ':', parameters.size())
-    #     print(name, ':', parameters)
-    #     exit(0)
-    if args.load is not None:
-        _ = load_checkpoint(model, None, None)
+    model = get_model(model_provider, wrap_with_ddp=False)
+    # print_rank_0(model[0])
+    # exit(0)
+    # if args.load is not None:
+    #     _ = load_checkpoint(model, None, None)
+        # static_dic = megatron_load(None, './model')
+
 
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
 
-    model = ds_inference(model, args)
+    # model = ds_inference(model, args)
 
     if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
+        import os
+        print('-------------------------------------rank0 pid: ---------------------------------------', os.getpid())
         server = MegatronServer(model, gen_kwargs)
         server.run("127.0.0.1")
-
-    while True:
-        choice = torch.LongTensor(1)
-        input_length_tensor = torch.LongTensor(1)
-        torch.distributed.broadcast(choice, 0)
-        if choice[0].item() == 0:
-            # Greedy or top-k
-            try:
-                torch.distributed.broadcast(input_length_tensor, 0)
-                input_ids_tensor = torch.LongTensor(
-                    [
+    else:
+        while True:
+            import os
+            print('-------------------------------------rank1 pid: ---------------------------------------', os.getpid())
+            choice = torch.xpu.LongTensor([GENERATE_NUM])
+            input_length_tensor = torch.xpu.LongTensor(1)
+            torch.distributed.broadcast(choice, 0)
+            if choice[0].item() == 0:
+                # Greedy or top-k
+                try:
+                    torch.distributed.broadcast(input_length_tensor, 0)
+                    input_ids_tensor = torch.xpu.LongTensor(
                         [
-                            0
-                            for _ in range(
-                                input_length_tensor[0].item()
-                                + gen_kwargs.get("max_new_tokens")
-                            )
+                            [
+                                0
+                                for _ in range(
+                                    input_length_tensor[0].item()
+                                    + gen_kwargs.get("max_new_tokens")
+                                )
+                            ]
                         ]
-                    ]
-                )
-                torch.distributed.broadcast(input_ids_tensor, 0)
-                generate_tokens_probs_and_return_on_first_stage(
-                    model,
-                    input_ids_tensor,
-                    input_length_tensor,
-                    top_k=gen_kwargs.get("top_k", 4),
-                    temperature=gen_kwargs.get("temperature", 1.0),
-                    min_length = gen_kwargs.get("min_new_tokens", 30),
-                )
-            except ValueError as ve:
-                pass
-        elif choice[0].item() == 1:
-            # Beam search
-            try:
-                torch.distributed.broadcast(input_length_tensor, 0)
-                input_ids_tensor = torch.LongTensor(
-                    [
+                    )
+                    torch.distributed.broadcast(input_ids_tensor, 0)
+                    generate_tokens_probs_and_return_on_first_stage(
+                        model,
+                        input_ids_tensor,
+                        input_length_tensor,
+                        top_k=gen_kwargs.get("top_k", 4),
+                        temperature=gen_kwargs.get("temperature", 1.0),
+                    )
+                except ValueError as ve:
+                    pass
+            elif choice[0].item() == 1:
+                # Beam search
+                try:
+                    torch.distributed.broadcast(input_length_tensor, 0)
+                    input_ids_tensor = torch.xpu.LongTensor(
                         [
-                            0
-                            for _ in range(
-                                input_length_tensor[0].item()
-                                + gen_kwargs.get("max_new_tokens")
-                            )
+                            [
+                                0
+                                for _ in range(
+                                    input_length_tensor[0].item()
+                                    + gen_kwargs.get("max_new_tokens")
+                                )
+                            ]
                         ]
-                    ]
-                )
-                torch.distributed.broadcast(input_ids_tensor, 0)
-                beam_search_and_return_on_first_stage(
-                    model,
-                    input_ids_tensor,
-                    input_length_tensor,
-                    beam_size=gen_kwargs.get("beam_size", 4),
-                    stop_token = gen_kwargs.get("beam_stop_token", 1),
-                    num_return_gen = gen_kwargs.get("beam_num_return_gen", 1),
-                    length_penalty = gen_kwargs.get("beam_length_penalty", 1),
-                    min_length = gen_kwargs.get("min_new_tokens", 30),
-                )
-            except ValueError as ve:
-                pass
+                    )
+                    torch.distributed.broadcast(input_ids_tensor, 0)
+                    beam_search_and_return_on_first_stage(
+                        model,
+                        input_ids_tensor,
+                        input_length_tensor,
+                        beam_size=gen_kwargs.get("beam_size", 4),
+                        stop_token = gen_kwargs.get("beam_stop_token", 1),
+                        num_return_gen = gen_kwargs.get("beam_num_return_gen", 1),
+                        length_penalty = gen_kwargs.get("beam_length_penalty", 1),
+                        min_length = gen_kwargs.get("min_new_tokens", 30),
+                    )
+                except ValueError as ve:
+                    pass
